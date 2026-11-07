@@ -36,10 +36,10 @@ function priceCents(
         finish === "foil"
             ? card.prices.usd_foil
             : finish === "etched"
-              ? card.prices.usd_etched
-              : finish === "nonfoil"
-                ? card.prices.usd
-                : null;
+                ? card.prices.usd_etched
+                : finish === "nonfoil"
+                    ? card.prices.usd
+                    : null;
 
     if (
         raw === null ||
@@ -59,7 +59,7 @@ function priceCents(
 async function missingVariants(
     transactionId: string,
     userId: number
-) {
+): Promise<Variant[]> {
     const [rows] = await db.execute<Variant[]>(
         `SELECT DISTINCT
             ti.scryfall_id,
@@ -137,8 +137,8 @@ export async function POST(request: NextRequest) {
                 ? rawId
                 : typeof rawId === "number" &&
                     Number.isSafeInteger(rawId)
-                  ? String(rawId)
-                  : "";
+                    ? String(rawId)
+                    : "";
 
         if (!/^[1-9]\d{0,19}$/.test(transactionId)) {
             return reply(
@@ -169,7 +169,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Skip prices already recorded today.
+        // Only request variants without a snapshot today.
         const missing = await missingVariants(
             transactionId,
             user.id
@@ -182,7 +182,6 @@ export async function POST(request: NextRequest) {
             });
         }
 
-        // Shared batch lookup replaces individual requests.
         const prices = await loadScryfallPrices(missing);
 
         const priced = missing.flatMap((variant) => {
@@ -197,14 +196,13 @@ export async function POST(request: NextRequest) {
                 : [{ ...variant, cents }];
         });
 
+        // The lookup succeeded, but the remaining variants have
+        // no usable USD price. This is not a server error.
         if (!priced.length) {
-            return reply(
-                {
-                    error:
-                        "No prices were available. Please try again later.",
-                },
-                503
-            );
+            return reply({
+                inserted: 0,
+                missing: missing.length,
+            });
         }
 
         const conn = await db.getConnection();
@@ -214,7 +212,9 @@ export async function POST(request: NextRequest) {
 
         try {
             const [locks] = await conn.execute<
-                (RowDataPacket & { acquired: number | null })[]
+                (RowDataPacket & {
+                    acquired: number | null;
+                })[]
             >(
                 `SELECT GET_LOCK(
                     'prowess_daily_price_snapshots',
@@ -237,7 +237,7 @@ export async function POST(request: NextRequest) {
             await conn.beginTransaction();
 
             try {
-                // Ownership may have changed during price lookups.
+                // Recheck ownership after the external lookups.
                 const [owned] =
                     await conn.execute<RowDataPacket[]>(
                         `SELECT id
@@ -324,7 +324,10 @@ export async function POST(request: NextRequest) {
         );
 
         return reply(
-            { error: "Could not record today's prices." },
+            {
+                error:
+                    "Could not record today's prices. Please retry.",
+            },
             500
         );
     }

@@ -1,8 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import {
+    useEffect,
+    useRef,
+    useState,
+    type FormEvent,
+} from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+
+import { importManaboxCSV } from "@/lib/importManaboxCSV";
 
 interface CollectionOption {
     id: number;
@@ -48,17 +55,34 @@ interface CardInput {
     cardName: string;
     setCode: string;
     collectorNumber: string;
+    importNotice?: string;
 }
 
 interface Props {
     collections: CollectionOption[];
 }
 
+interface PrintingSearchResult {
+    data: PrintingOption[];
+    has_more: boolean;
+}
+
+const MAX_QUANTITY = 4294967295;
+const MAX_ITEMS = 1000;
+const BATCH_SIZE = 75;
+const CARDS_PER_PAGE = 10;
+
+const SUPPORTED_FINISHES = ["nonfoil", "foil", "etched"];
+const CONDITIONS = ["NM", "LP", "MP", "HP", "DMG"];
+
+const UUID_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const inputClass =
-    "w-full rounded-lg border border-zinc-300 bg-white p-3 text-black dark:border-zinc-700 dark:bg-zinc-900 dark:text-white";
+    "w-full rounded-xl border border-border bg-background p-3 text-foreground";
 
 const buttonClass =
-    "rounded-lg border px-4 py-2 disabled:opacity-50";
+    "rounded-xl border border-border bg-surface px-4 py-2 text-sm font-medium text-foreground transition-colors enabled:hover:border-teal enabled:hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-40";
 
 function emptyCard(rowKey: number): CardInput {
     return {
@@ -81,22 +105,22 @@ async function readJSON(response: Response) {
 
     if (!contentType.includes("application/json")) {
         throw new Error(
-            `Expected JSON but received another response ` +
-            `(status ${response.status}). Check the API route.`
+            `Expected JSON (status ${response.status}). Check the API route.`
         );
     }
 
     return response.json();
 }
 
-// Space searches across purchase rows in this browser tab.
+// Share one request queue between CSV imports and manual searches.
 let searchQueue: Promise<void> = Promise.resolve();
 
-async function searchPrintings(
-    query: string,
-    page: number,
-    signal: AbortSignal
-): Promise<{ data: PrintingOption[]; has_more: boolean }> {
+async function queuedScryfallRequest<T>(
+    url: string,
+    signal: AbortSignal,
+    init: RequestInit = {},
+    allowNotFound = false
+): Promise<T | null> {
     const previous = searchQueue;
     let release!: () => void;
 
@@ -109,52 +133,315 @@ async function searchPrintings(
     try {
         signal.throwIfAborted();
 
-        const params = new URLSearchParams({
-            q: `!${JSON.stringify(query)} game:paper`,
-            unique: "prints",
-            include_variations: "true",
-            order: "released",
-            dir: "desc",
-            page: String(page),
+        const headers = new Headers(init.headers);
+        headers.set("Accept", "application/json");
+
+        const response = await fetch(url, {
+            ...init,
+            headers,
+            signal: AbortSignal.any([
+                signal,
+                AbortSignal.timeout(30000),
+            ]),
         });
 
-        const response = await fetch(
-            `https://api.scryfall.com/cards/search?${params}`,
-            {
-                headers: {
-                    Accept: "application/json",
-                },
-                signal: AbortSignal.any([
-                    signal,
-                    AbortSignal.timeout(15000),
-                ]),
-            }
-        );
-
-        if (response.status === 404) {
-            return {
-                data: [],
-                has_more: false,
-            };
+        if (allowNotFound && response.status === 404) {
+            return null;
         }
 
         if (response.status === 429) {
             throw new Error(
-                "Search is busy. Wait a moment and try again."
+                "Scryfall is busy. Wait a moment before trying again."
             );
         }
 
         if (!response.ok) {
             throw new Error(
-                `Card search failed (${response.status}).`
+                `Card lookup failed (${response.status}).`
             );
         }
 
-        return response.json();
+        return (await response.json()) as T;
     } finally {
         await new Promise((resolve) => setTimeout(resolve, 550));
         release();
     }
+}
+
+async function searchPrintings(
+    query: string,
+    page: number,
+    signal: AbortSignal
+): Promise<PrintingSearchResult> {
+    const params = new URLSearchParams({
+        q: `!${JSON.stringify(query)} game:paper`,
+        unique: "prints",
+        include_variations: "true",
+        order: "released",
+        dir: "desc",
+        page: String(page),
+    });
+
+    const result =
+        await queuedScryfallRequest<PrintingSearchResult>(
+            `https://api.scryfall.com/cards/search?${params}`,
+            signal,
+            {},
+            true
+        );
+
+    return result ?? { data: [], has_more: false };
+}
+
+function csvValue(
+    row: Record<string, unknown>,
+    ...columns: string[]
+): string {
+    for (const column of columns) {
+        const value = row[column];
+
+        if (
+            (typeof value === "string" ||
+                typeof value === "number" ||
+                typeof value === "boolean") &&
+            String(value).trim()
+        ) {
+            return String(value).trim();
+        }
+    }
+
+    return "";
+}
+
+function normalizeCondition(value: string): string {
+    const key = value.toLowerCase().replace(/[\s_-]/g, "");
+
+    // Convert export conditions to the conditions used by the form.
+    const conditions: Record<string, string> = {
+        m: "NM",
+        mint: "NM",
+        nm: "NM",
+        nearmint: "NM",
+
+        ex: "LP",
+        excellent: "LP",
+        lp: "LP",
+        lightplayed: "LP",
+        lightlyplayed: "LP",
+
+        gd: "MP",
+        good: "MP",
+        mp: "MP",
+        moderatelyplayed: "MP",
+
+        hp: "HP",
+        heavilyplayed: "HP",
+
+        dmg: "DMG",
+        damaged: "DMG",
+    };
+
+    const condition = conditions[key || "nm"];
+
+    if (!condition) {
+        throw new Error(`Unrecognized condition "${value}".`);
+    }
+
+    return condition;
+}
+
+function normalizeFinish(value: string): string {
+    const key = value.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    if (!key || ["normal", "regular", "standard", "false", "no", "0", "n"].includes(key)) {
+        return "nonfoil";
+    }
+    if (key.includes("nonfoil") || key.includes("notfoil") || key.includes("nofoil")) {
+        return "nonfoil";
+    }
+    if (key.includes("etched")) return "etched";
+    if (key.includes("foil") || ["true", "yes", "1", "y", "f", "holo", "holographic"].includes(key)) {
+        return "foil";
+    }
+
+    // An unknown finish is reviewed in the form instead of aborting the import.
+    return "";
+}
+
+function normalizeLanguage(value: string): string {
+    const key = value.trim().toLowerCase().replace(/_/g, "-");
+    const languages: Record<string, string> = {
+        english: "en", japanese: "ja", german: "de", french: "fr",
+        italian: "it", spanish: "es", portuguese: "pt", russian: "ru",
+        korean: "ko", latin: "la", ancientgreek: "grc", arabic: "ar",
+        hebrew: "he", sanskrit: "sa", phyrexian: "ph",
+        "ancient greek": "grc", "anglo-saxon": "ang", "old english": "ang",
+        "simplified chinese": "zhs", "chinese simplified": "zhs",
+        "zh-cn": "zhs", "zh-sg": "zhs", "zh-hans": "zhs",
+        "traditional chinese": "zht", "chinese traditional": "zht",
+        "zh-tw": "zht", "zh-hk": "zht", "zh-mo": "zht", "zh-hant": "zht",
+    };
+    if (!key) return "en";
+    if (languages[key]) return languages[key];
+    if (key.startsWith("zh-hans-")) return "zhs";
+    if (key.startsWith("zh-hant-")) return "zht";
+
+    const base = key.split("-")[0]!;
+    if (["en", "ja", "de", "fr", "it", "es", "pt", "ru", "ko"].includes(base)) {
+        return base;
+    }
+
+    // Preserve unfamiliar language values instead of changing them to English.
+    // Overlong values remain editable and must be corrected before saving.
+    return key;
+}
+
+function validQuantity(value: string): boolean {
+    const quantity = Number(value);
+
+    return (
+        /^[1-9]\d*$/.test(value) &&
+        Number.isSafeInteger(quantity) &&
+        quantity <= MAX_QUANTITY
+    );
+}
+
+function validatePrinting(
+    printing: PrintingOption,
+    name: string,
+    setCode: string,
+    collectorNumber: string
+) {
+    if (printing.set.toLowerCase() !== setCode.toLowerCase()) {
+        throw new Error(
+            `${name}: the Scryfall ID does not match ` +
+            `set code "${setCode}".`
+        );
+    }
+
+    if (
+        collectorNumber &&
+        printing.collector_number.toLowerCase() !==
+            collectorNumber.toLowerCase()
+    ) {
+        throw new Error(
+            `${name}: the printing does not match ` +
+            `collector number "${collectorNumber}".`
+        );
+    }
+}
+
+async function loadCSVPrintings(
+    ids: string[],
+    signal: AbortSignal,
+    onProgress: (message: string) => void
+): Promise<Map<string, PrintingOption>> {
+    const uniqueIds = [
+        ...new Set(
+            ids
+                .map((id) => id.trim().toLowerCase())
+                .filter(Boolean)
+        ),
+    ];
+
+    for (const id of uniqueIds) {
+        if (!UUID_PATTERN.test(id)) {
+            throw new Error(`Invalid Scryfall ID: ${id}`);
+        }
+    }
+
+    const printings = new Map<string, PrintingOption>();
+
+    for (
+        let offset = 0;
+        offset < uniqueIds.length;
+        offset += BATCH_SIZE
+    ) {
+        signal.throwIfAborted();
+
+        const batch = uniqueIds.slice(offset, offset + BATCH_SIZE);
+        onProgress("Loading…");
+
+        const result = await queuedScryfallRequest<{
+            data: PrintingOption[];
+        }>(
+            "https://api.scryfall.com/cards/collection",
+            signal,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    identifiers: batch.map((id) => ({ id })),
+                }),
+            }
+        );
+
+        if (!result || !Array.isArray(result.data)) {
+            throw new Error("Scryfall returned an invalid card batch.");
+        }
+
+        // Match by ID because response order is not used.
+        for (const printing of result.data) {
+            printings.set(printing.id.toLowerCase(), printing);
+        }
+    }
+
+    return printings;
+}
+
+// Used only for CSV rows that do not include Scryfall IDs.
+async function resolveCSVPrinting(
+    name: string,
+    setCode: string,
+    collectorNumber: string,
+    signal: AbortSignal
+): Promise<PrintingOption> {
+    const matches = new Map<string, PrintingOption>();
+    let page = 1;
+
+    while (true) {
+        const result = await searchPrintings(name, page, signal);
+
+        for (const printing of result.data) {
+            if (
+                printing.set.toLowerCase() !==
+                setCode.toLowerCase()
+            ) {
+                continue;
+            }
+
+            if (
+                collectorNumber &&
+                printing.collector_number.toLowerCase() !==
+                    collectorNumber.toLowerCase()
+            ) {
+                continue;
+            }
+
+            matches.set(printing.id, printing);
+        }
+
+        if (!result.has_more) break;
+        page += 1;
+    }
+
+    if (matches.size === 0) {
+        throw new Error(
+            `No matching printing for ${name} (${setCode}` +
+            `${collectorNumber ? ` #${collectorNumber}` : ""}).`
+        );
+    }
+
+    if (matches.size > 1) {
+        throw new Error(
+            `${name} has multiple matching printings. ` +
+            "Include its Collector number or Scryfall ID."
+        );
+    }
+
+    return Array.from(matches.values())[0]!;
 }
 
 function PurchaseCardSearch({
@@ -174,10 +461,6 @@ function PurchaseCardSearch({
     const [searched, setSearched] = useState(false);
 
     const pending = useRef<AbortController | null>(null);
-
-    const selected = results.find(
-        (printing) => printing.id === selectedId
-    );
 
     useEffect(() => {
         return () => pending.current?.abort();
@@ -214,9 +497,7 @@ function PurchaseCardSearch({
             if (controller.signal.aborted) return;
 
             setResults((current) =>
-                more
-                    ? [...current, ...result.data]
-                    : result.data
+                more ? [...current, ...result.data] : result.data
             );
 
             setPage(nextPage);
@@ -237,6 +518,10 @@ function PurchaseCardSearch({
             }
         }
     }
+
+    const selected = results.find(
+        (printing) => printing.id === selectedId
+    );
 
     const image =
         selected?.image_uris?.small ??
@@ -283,13 +568,13 @@ function PurchaseCardSearch({
                 {loading ? "Searching…" : "Search Printings"}
             </button>
 
-            <p className="text-sm text-zinc-500">
-                Enter the full card name, then choose its set and
-                collector number.
+            <p className="text-sm text-muted">
+                Enter the full card name, then choose its set
+                and collector number.
             </p>
 
             {error && (
-                <p role="alert" className="text-red-500">
+                <p role="alert" className="text-red-400">
                     {error}
                 </p>
             )}
@@ -336,14 +621,14 @@ function PurchaseCardSearch({
                     type="button"
                     disabled={loading}
                     onClick={() => void search(true)}
-                    className="underline disabled:opacity-50"
+                    className={buttonClass}
                 >
                     Load More Printings
                 </button>
             )}
 
             {selected && (
-                <div className="flex items-center gap-4 rounded-lg border p-3">
+                <div className="flex items-center gap-4 rounded-xl border border-border p-3">
                     {image && (
                         <img
                             src={image}
@@ -369,20 +654,31 @@ function PurchaseCardSearch({
 
 export default function TransactionForm({ collections }: Props) {
     const router = useRouter();
+
     const [collectionId, setCollectionId] = useState(
         collections[0] ? String(collections[0].id) : ""
     );
 
     const [name, setName] = useState("");
-    const [type, setType] = useState<"purchase" | "sale">("sale");
+    const [type, setType] =
+        useState<"purchase" | "sale">("purchase");
     const [totalAmount, setTotalAmount] = useState("");
     const [notes, setNotes] = useState("");
 
-    const [items, setItems] = useState<CardInput[]>([
-        emptyCard(0),
-    ]);
-
+    const [items, setItems] = useState<CardInput[]>([emptyCard(0)]);
     const nextRowKey = useRef(1);
+    const [cardPage, setCardPage] = useState(1);
+
+    const totalCardPages = Math.max(
+        1,
+        Math.ceil(items.length / CARDS_PER_PAGE)
+    );
+    const currentCardPage = Math.min(cardPage, totalCardPages);
+    const cardOffset = (currentCardPage - 1) * CARDS_PER_PAGE;
+    const visibleItems = items.slice(
+        cardOffset,
+        cardOffset + CARDS_PER_PAGE
+    );
 
     const [ownedCards, setOwnedCards] = useState<OwnedCard[]>([]);
     const [loadingCards, setLoadingCards] = useState(false);
@@ -390,8 +686,26 @@ export default function TransactionForm({ collections }: Props) {
     const [reload, setReload] = useState(0);
 
     const [busy, setBusy] = useState(false);
+    const savingRef = useRef(false);
+
     const [error, setError] = useState("");
     const [success, setSuccess] = useState("");
+
+    const [importing, setImporting] = useState(false);
+    const [importProgress, setImportProgress] = useState("");
+    const [importFileName, setImportFileName] = useState("");
+
+    const importController = useRef<AbortController | null>(null);
+
+    const locked = busy || importing;
+
+    const saleUnavailable =
+        type === "sale" &&
+        (loadingCards || !!cardsError || ownedCards.length === 0);
+
+    useEffect(() => {
+        return () => importController.current?.abort();
+    }, []);
 
     useEffect(() => {
         if (!collectionId || type !== "sale") {
@@ -425,6 +739,12 @@ export default function TransactionForm({ collections }: Props) {
                     );
                 }
 
+                if (!Array.isArray(data.cards)) {
+                    throw new Error(
+                        "The collection API returned an invalid card list."
+                    );
+                }
+
                 if (!controller.signal.aborted) {
                     setOwnedCards(data.cards);
                 }
@@ -449,8 +769,9 @@ export default function TransactionForm({ collections }: Props) {
     }, [collectionId, type, reload]);
 
     function resetSelection() {
-        const fresh = emptyCard(nextRowKey.current++);
-        setItems([fresh]);
+        setItems([emptyCard(nextRowKey.current++)]);
+        setCardPage(1);
+        setImportFileName("");
         setError("");
         setSuccess("");
     }
@@ -477,17 +798,20 @@ export default function TransactionForm({ collections }: Props) {
         setItems((current) =>
             current.map((item) => {
                 if (item.rowKey !== rowKey) return item;
-
                 if (!card) return emptyCard(rowKey);
 
                 return {
                     ...item,
                     ownedId,
                     scryfallId: card.scryfallId,
-                    quantity: "1",
+                    quantity: item.quantity,
                     condition: card.condition,
                     finish: card.finish,
                     language: card.language,
+                    cardName: card.name,
+                    setCode: "",
+                    collectorNumber: "",
+                    availableFinishes: [],
                 };
             })
         );
@@ -514,8 +838,7 @@ export default function TransactionForm({ collections }: Props) {
                 }
 
                 const supported = printing.finishes.filter(
-                    (finish) =>
-                        ["nonfoil", "foil", "etched"].includes(finish)
+                    (finish) => SUPPORTED_FINISHES.includes(finish)
                 );
 
                 return {
@@ -533,11 +856,336 @@ export default function TransactionForm({ collections }: Props) {
         );
     }
 
+    async function handleTransactionCSV(file: File | undefined) {
+        if (
+            !file ||
+            locked ||
+            savingRef.current ||
+            importController.current
+        ) {
+            return;
+        }
+
+        setError("");
+        setSuccess("");
+
+        if (type === "sale" && saleUnavailable) {
+            setError(
+                "Load your collection cards before importing a sale."
+            );
+            return;
+        }
+
+        if (file.size > 5 * 1024 * 1024) {
+            setError("Choose a CSV smaller than 5 MB.");
+            return;
+        }
+
+        const controller = new AbortController();
+        importController.current = controller;
+
+        setImporting(true);
+        setImportProgress("Loading…");
+
+        try {
+            const csv = await file.text();
+            controller.signal.throwIfAborted();
+
+            const rows = importManaboxCSV(csv);
+
+            if (rows.length === 0 || rows.length > MAX_ITEMS) {
+                throw new Error(
+                    `The CSV must contain 1–${MAX_ITEMS} card rows.`
+                );
+            }
+
+            // Validate the local fields before making API requests.
+            const preparedRows = rows.map((rawRow, index) => {
+                try {
+                    const row =
+                        rawRow as unknown as Record<string, unknown>;
+
+                    const cardName = csvValue(row, "Name");
+                    const setCode = csvValue(
+                        row,
+                        "Set code"
+                    ).toLowerCase();
+
+                    const collectorNumber = csvValue(
+                        row,
+                        "Collector number",
+                        "Collector Number"
+                    );
+
+                    const scryfallId = csvValue(
+                        row,
+                        "Scryfall ID",
+                        "Scryfall Id",
+                        "Scryfall id"
+                    ).toLowerCase();
+
+                    const quantityText =
+                        csvValue(row, "Quantity") || "1";
+
+                    if (!cardName || !setCode) {
+                        throw new Error(
+                            "Name and Set code are required."
+                        );
+                    }
+
+                    if (!validQuantity(quantityText)) {
+                        throw new Error(
+                            "Quantity must be a positive integer."
+                        );
+                    }
+
+                    if (
+                        scryfallId &&
+                        !UUID_PATTERN.test(scryfallId)
+                    ) {
+                        throw new Error("Invalid Scryfall ID.");
+                    }
+
+                    return {
+                        cardName,
+                        setCode,
+                        collectorNumber,
+                        scryfallId,
+                        quantity: Number(quantityText),
+                        condition: normalizeCondition(
+                            csvValue(row, "Condition")
+                        ),
+                        rawFinish: csvValue(row, "Foil", "Finish"),
+                        finish: normalizeFinish(
+                            csvValue(row, "Foil", "Finish")
+                        ),
+                        language: normalizeLanguage(
+                            csvValue(row, "Language")
+                        ),
+                    };
+                } catch (error) {
+                    throw new Error(
+                        `CSV card row ${index + 1}: ${
+                            error instanceof Error
+                                ? error.message
+                                : "Invalid card."
+                        }`
+                    );
+                }
+            });
+
+            const batchPrintings = await loadCSVPrintings(
+                preparedRows.map((row) => row.scryfallId),
+                controller.signal,
+                setImportProgress
+            );
+
+            const importedItems: CardInput[] = [];
+            const requested = new Map<string, number>();
+            const groupedQuantities = new Map<string, number>();
+            const fallbackCache = new Map<string, PrintingOption>();
+
+            const ownedByVariant = new Map<string, OwnedCard[]>();
+
+            for (const owned of ownedCards) {
+                const key = JSON.stringify([
+                    owned.scryfallId.toLowerCase(),
+                    owned.condition,
+                    owned.finish,
+                    owned.language,
+                ]);
+
+                const matches = ownedByVariant.get(key) ?? [];
+                matches.push(owned);
+                ownedByVariant.set(key, matches);
+            }
+
+            setImportProgress("Loading…");
+
+            for (const [index, row] of preparedRows.entries()) {
+                controller.signal.throwIfAborted();
+
+                try {
+                    let printing: PrintingOption;
+
+                    if (row.scryfallId) {
+                        const found = batchPrintings.get(
+                            row.scryfallId
+                        );
+
+                        if (!found) {
+                            throw new Error(
+                                `Scryfall could not find ${row.cardName} ` +
+                                `with ID ${row.scryfallId}.`
+                            );
+                        }
+
+                        printing = found;
+                    } else {
+                        const cacheKey = JSON.stringify([
+                            row.cardName,
+                            row.setCode,
+                            row.collectorNumber,
+                        ]);
+
+                        let found = fallbackCache.get(cacheKey);
+
+                        if (!found) {
+                            setImportProgress("Loading…");
+
+                            found = await resolveCSVPrinting(
+                                row.cardName,
+                                row.setCode,
+                                row.collectorNumber,
+                                controller.signal
+                            );
+
+                            fallbackCache.set(cacheKey, found);
+                        }
+
+                        printing = found;
+                    }
+
+                    validatePrinting(
+                        printing,
+                        row.cardName,
+                        row.setCode,
+                        row.collectorNumber
+                    );
+
+                    const supported = printing.finishes.filter(
+                        (finish) => SUPPORTED_FINISHES.includes(finish)
+                    );
+
+                    const finish = supported.includes(row.finish) ? row.finish : "";
+                    const notices: string[] = [];
+                    if (!finish) {
+                        notices.push(
+                            `CSV finish "${row.rawFinish || "nonfoil"}" needs review. Choose a finish for this printing.`
+                        );
+                    }
+                    if (row.language.length > 100) {
+                        notices.push("The language value exceeds 100 characters. Edit it before saving.");
+                    }
+
+                    const variantKey = JSON.stringify([
+                        printing.id.toLowerCase(),
+                        row.condition,
+                        row.finish,
+                        row.language,
+                    ]);
+
+                    const combinedQuantity =
+                        (groupedQuantities.get(variantKey) ?? 0) +
+                        row.quantity;
+
+                    if (combinedQuantity > MAX_QUANTITY) {
+                        throw new Error(
+                            "Combined quantity exceeds the limit."
+                        );
+                    }
+
+                    groupedQuantities.set(
+                        variantKey,
+                        combinedQuantity
+                    );
+
+                    let ownedId = "";
+
+                    if (type === "sale") {
+                        const candidates =
+                            ownedByVariant.get(variantKey) ?? [];
+
+                        if (candidates.length !== 1 || !finish) {
+                            notices.push(
+                                "No unique owned variant was selected. Choose the correct card from your collection before saving."
+                            );
+                        } else {
+                            const owned = candidates[0]!;
+                            ownedId = String(owned.id);
+                            const combined = (requested.get(ownedId) ?? 0) + row.quantity;
+                            if (combined > Number(owned.quantity)) {
+                                throw new Error(
+                                    `The CSV requests ${combined} copies of ${printing.name}, ` +
+                                    `but you own ${owned.quantity} in this variant.`
+                                );
+                            }
+                            requested.set(ownedId, combined);
+                        }
+                    }
+
+                    importedItems.push({
+                        rowKey: nextRowKey.current++,
+                        ownedId,
+                        scryfallId: printing.id,
+                        availableFinishes: supported,
+                        quantity: String(row.quantity),
+                        condition: row.condition,
+                        finish,
+                        language: row.language,
+                        importNotice: notices.join(" "),
+                        cardName: printing.name,
+                        setCode: printing.set,
+                        collectorNumber: printing.collector_number,
+                    });
+                } catch (error) {
+                    controller.signal.throwIfAborted();
+
+                    throw new Error(
+                        `CSV card row ${index + 1}: ${
+                            error instanceof Error
+                                ? error.message
+                                : "Could not import this card."
+                        }`
+                    );
+                }
+            }
+
+            controller.signal.throwIfAborted();
+
+            // Replace the form only when the whole import succeeds.
+            setItems(importedItems);
+            setCardPage(1);
+            setImportFileName(file.name);
+
+            const reviewCount = importedItems.filter((item) => item.importNotice).length;
+            setSuccess(
+                `Loaded ${importedItems.length} card rows. ` +
+                (reviewCount ? `${reviewCount} rows have import notices. ` : "") +
+                "Review the cards, any import notices, and the total, then save the transaction."
+            );
+        } catch (error) {
+            if (!controller.signal.aborted) {
+                setError(
+                    error instanceof Error
+                        ? error.message
+                        : "Could not import CSV."
+                );
+            }
+        } finally {
+            if (importController.current === controller) {
+                importController.current = null;
+
+                if (!controller.signal.aborted) {
+                    setImporting(false);
+                    setImportProgress("");
+                }
+            }
+        }
+    }
+
     async function handleSubmit(
         event: FormEvent<HTMLFormElement>
     ) {
         event.preventDefault();
-        if (busy) return;
+
+        if (
+            locked ||
+            savingRef.current ||
+            importController.current
+        ) {
+            return;
+        }
 
         setError("");
         setSuccess("");
@@ -554,43 +1202,77 @@ export default function TransactionForm({ collections }: Props) {
             return;
         }
 
-        if (
-            type === "sale" &&
-            (loadingCards || cardsError || !ownedCards.length)
-        ) {
+        if (saleUnavailable) {
             setError("Load your collection cards before saving.");
             return;
         }
 
+        if (items.length === 0 || items.length > MAX_ITEMS) {
+            setError(`Provide 1–${MAX_ITEMS} card items.`);
+            return;
+        }
+
         const requested = new Map<string, number>();
+        const groupedQuantities = new Map<string, number>();
 
         for (const [index, item] of items.entries()) {
+            const showCardError = (message: string) => {
+                setCardPage(Math.floor(index / CARDS_PER_PAGE) + 1);
+                setError(message);
+            };
+            if (!validQuantity(item.quantity)) {
+                showCardError(
+                    `Card ${index + 1}: enter a valid quantity.`
+                );
+                return;
+            }
+
             const quantity = Number(item.quantity);
 
             if (
-                !/^[1-9]\d*$/.test(item.quantity) ||
-                !Number.isSafeInteger(quantity) ||
-                quantity > 4294967295
+                type === "purchase" &&
+                (
+                    !UUID_PATTERN.test(item.scryfallId) ||
+                    !item.cardName ||
+                    !item.setCode ||
+                    !item.collectorNumber ||
+                    !item.availableFinishes.includes(item.finish)
+                )
             ) {
-                setError(
-                    `Card ${index + 1}: enter a valid quantity.`
+                showCardError(
+                    `Card ${index + 1}: select a printing and finish.`
                 );
                 return;
             }
 
             if (
                 type === "purchase" &&
-                (
-                    !item.scryfallId ||
-                    !item.availableFinishes.includes(item.finish)
-                )
+                (!item.language.trim() || item.language.trim().length > 100)
             ) {
-                setError(
-                    `Card ${index + 1}: search by name and ` +
-                    "select a printing and finish."
+                showCardError(
+                    `Card ${index + 1}: enter a language value containing 1–100 characters.`
                 );
                 return;
             }
+
+            const variantKey = JSON.stringify([
+                item.scryfallId.toLowerCase(),
+                item.condition,
+                item.finish,
+                item.language,
+            ]);
+
+            const combinedVariant =
+                (groupedQuantities.get(variantKey) ?? 0) + quantity;
+
+            if (combinedVariant > MAX_QUANTITY) {
+                showCardError(
+                    `Card ${index + 1}: combined quantity is too large.`
+                );
+                return;
+            }
+
+            groupedQuantities.set(variantKey, combinedVariant);
 
             if (type === "sale") {
                 const owned = ownedCards.find(
@@ -598,7 +1280,7 @@ export default function TransactionForm({ collections }: Props) {
                 );
 
                 if (!owned) {
-                    setError(
+                    showCardError(
                         `Card ${index + 1}: select an owned card.`
                     );
                     return;
@@ -607,10 +1289,10 @@ export default function TransactionForm({ collections }: Props) {
                 const combined =
                     (requested.get(item.ownedId) ?? 0) + quantity;
 
-                if (combined > owned.quantity) {
-                    setError(
+                if (combined > Number(owned.quantity)) {
+                    showCardError(
                         `You only own ${owned.quantity} copies ` +
-                        `of ${owned.name}.`
+                        `of ${owned.name} in this variant.`
                     );
                     return;
                 }
@@ -619,6 +1301,7 @@ export default function TransactionForm({ collections }: Props) {
             }
         }
 
+        savingRef.current = true;
         setBusy(true);
 
         try {
@@ -655,22 +1338,18 @@ export default function TransactionForm({ collections }: Props) {
                 );
             }
 
-            setSuccess(
-                `Transaction saved successfully.`
-            );
-
+            setSuccess("Transaction saved successfully.");
             setName("");
             setTotalAmount("");
             setNotes("");
-
-            const fresh = emptyCard(nextRowKey.current++);
-            setItems([fresh]);
+            setImportFileName("");
+            setItems([emptyCard(nextRowKey.current++)]);
+            setCardPage(1);
 
             setOwnedCards([]);
             setLoadingCards(type === "sale");
             setReload((current) => current + 1);
 
-            // Refresh the transaction history table and count.
             router.refresh();
         } catch (error) {
             setError(
@@ -679,13 +1358,10 @@ export default function TransactionForm({ collections }: Props) {
                     : "Could not save transaction."
             );
         } finally {
+            savingRef.current = false;
             setBusy(false);
         }
     }
-
-    const saleUnavailable =
-        type === "sale" &&
-        (loadingCards || !!cardsError || ownedCards.length === 0);
 
     if (collections.length === 0) {
         return (
@@ -699,20 +1375,30 @@ export default function TransactionForm({ collections }: Props) {
     }
 
     return (
-        <form onSubmit={handleSubmit} className="mt-6">
+        <form
+            onSubmit={handleSubmit}
+            aria-busy={locked}
+            className="mt-6"
+        >
             {error && (
-                <p role="alert" className="mb-4 text-red-500">
+                <p
+                    role="alert"
+                    className="mb-4 rounded-xl border border-red-400/25 bg-red-400/10 p-4 text-sm text-red-300"
+                >
                     {error}
                 </p>
             )}
 
             {success && (
-                <p role="status" className="mb-4 text-green-600">
+                <p
+                    role="status"
+                    className="mb-4 rounded-xl border border-green-400/25 bg-green-400/10 p-4 text-sm text-green-300"
+                >
                     {success}
                 </p>
             )}
 
-            <fieldset disabled={busy} className="space-y-6">
+            <fieldset disabled={locked} className="space-y-6">
                 <label className="flex flex-col gap-2">
                     Collection
 
@@ -721,6 +1407,7 @@ export default function TransactionForm({ collections }: Props) {
                         onChange={(event) => {
                             setCollectionId(event.target.value);
                             setOwnedCards([]);
+                            setCardsError("");
                             setLoadingCards(type === "sale");
                             resetSelection();
                         }}
@@ -771,13 +1458,14 @@ export default function TransactionForm({ collections }: Props) {
 
                                 setType(nextType);
                                 setOwnedCards([]);
+                                setCardsError("");
                                 setLoadingCards(nextType === "sale");
                                 resetSelection();
                             }}
                             className={inputClass}
                         >
-                            <option value="sale">Sale</option>
                             <option value="purchase">Purchase</option>
+                            <option value="sale">Sale</option>
                         </select>
                     </label>
 
@@ -798,7 +1486,7 @@ export default function TransactionForm({ collections }: Props) {
                     </label>
                 </div>
 
-                <p className="text-sm text-zinc-500">
+                <p className="text-sm text-muted">
                     {type === "sale"
                         ? "Saving removes the sold quantities."
                         : "Saving adds the purchased quantities."}
@@ -806,30 +1494,24 @@ export default function TransactionForm({ collections }: Props) {
                 </p>
 
                 {type === "sale" && (
-                    <>
+                    <div className="space-y-3">
                         {loadingCards && (
-                            <p role="status">
-                                Loading your cards…
-                            </p>
+                            <p role="status">Loading your cards…</p>
                         )}
 
                         {cardsError && (
                             <div>
-                                <p
-                                    role="alert"
-                                    className="text-red-500"
-                                >
+                                <p role="alert" className="text-red-400">
                                     {cardsError}
                                 </p>
 
                                 <button
                                     type="button"
-                                    onClick={() =>
-                                        setReload(
-                                            (current) => current + 1
-                                        )
-                                    }
-                                    className="mt-2 underline"
+                                    onClick={() => {
+                                        setLoadingCards(true);
+                                        setReload((current) => current + 1);
+                                    }}
+                                    className={`${buttonClass} mt-2`}
                                 >
                                     Try Again
                                 </button>
@@ -843,26 +1525,90 @@ export default function TransactionForm({ collections }: Props) {
                                     This collection has no cards to sell.
                                 </p>
                             )}
-                    </>
+                    </div>
                 )}
 
-                <section className="space-y-4">
-                    <h2 className="text-xl font-semibold">
-                        Cards
-                    </h2>
+                <div className="space-y-3 rounded-xl border border-dashed border-teal/35 bg-teal/5 p-5">
+                    <label className="flex flex-col gap-3">
+                        <span className="font-semibold">
+                            Import cards from CSV
+                        </span>
 
-                    {items.map((item, index) => {
+                        <span className="text-sm text-muted">
+                            Upload a ManaBox export for this{" "}
+                            {type === "sale" ? "sale" : "purchase"}.
+                            A successful import replaces the card rows below.
+                        </span>
+
+                        <input
+                            type="file"
+                            accept=".csv,text/csv"
+                            disabled={locked || saleUnavailable}
+                            onChange={(event) => {
+                                const file = event.target.files?.[0];
+                                event.target.value = "";
+                                void handleTransactionCSV(file);
+                            }}
+                            className={inputClass}
+                        />
+                    </label>
+
+                    <p className="text-sm text-muted">
+                        Name and Set code are required. Including Scryfall ID
+                        makes imports faster and identifies the exact printing.
+                        Missing optional values default to quantity 1, NM,
+                        nonfoil, and English.
+                    </p>
+
+                    <p className="text-sm text-muted">
+                        {type === "sale"
+                            ? "Cards must match the printing, condition, finish, and language you own."
+                            : "Purchased cards are added to the selected collection when saved."}
+                        {" "}Enter the transaction total separately.
+                        Uploading alone does not change inventory.
+                    </p>
+
+                    {importing && (
+                        <p role="status" className="text-sm text-teal">
+                            {importProgress}
+                        </p>
+                    )}
+
+                    {importFileName && (
+                        <p className="break-words text-sm text-muted">
+                            Loaded file: {importFileName}
+                        </p>
+                    )}
+                </div>
+
+                <section className="space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h2 className="text-xl font-semibold">Cards</h2>
+
+                        <span className="badge">
+                            {items.length}{" "}
+                            {items.length === 1 ? "row" : "rows"}
+                        </span>
+                    </div>
+
+                    <p className="text-sm text-muted">
+                        Showing {cardOffset + 1}–
+                        {Math.min(cardOffset + CARDS_PER_PAGE, items.length)}
+                        {" "}of {items.length} card rows
+                    </p>
+
+                    {visibleItems.map((item, pageIndex) => {
+                        const index = cardOffset + pageIndex;
                         const selected = ownedCards.find(
-                            (card) =>
-                                String(card.id) === item.ownedId
+                            (card) => String(card.id) === item.ownedId
                         );
 
                         return (
                             <div
                                 key={item.rowKey}
-                                className="space-y-4 rounded-xl border p-4"
+                                className="space-y-4 rounded-xl border border-border p-4"
                             >
-                                <div className="flex justify-between">
+                                <div className="flex items-center justify-between gap-3">
                                     <h3 className="font-medium">
                                         Card {index + 1}
                                     </h3>
@@ -870,20 +1616,31 @@ export default function TransactionForm({ collections }: Props) {
                                     <button
                                         type="button"
                                         disabled={items.length === 1}
-                                        onClick={() =>
+                                        onClick={() => {
                                             setItems((current) =>
                                                 current.filter(
                                                     (entry) =>
-                                                        entry.rowKey !==
-                                                        item.rowKey
+                                                        entry.rowKey !== item.rowKey
                                                 )
-                                            )
-                                        }
-                                        className="text-red-500 disabled:opacity-40"
+                                            );
+                                            setCardPage(Math.min(
+                                                currentCardPage,
+                                                Math.max(1, Math.ceil(
+                                                    (items.length - 1) / CARDS_PER_PAGE
+                                                ))
+                                            ));
+                                        }}
+                                        className="text-sm text-red-400 disabled:opacity-40"
                                     >
                                         Remove
                                     </button>
                                 </div>
+
+                                {item.importNotice && (
+                                    <p className="rounded-xl border border-accent/25 bg-accent/5 p-3 text-sm text-accent">
+                                        {item.importNotice}
+                                    </p>
+                                )}
 
                                 {type === "sale" ? (
                                     <>
@@ -926,7 +1683,7 @@ export default function TransactionForm({ collections }: Props) {
                                         </label>
 
                                         {selected && (
-                                            <p className="text-sm text-zinc-500">
+                                            <p className="text-sm text-muted">
                                                 {selected.quantity} available.
                                                 Printing, condition, finish,
                                                 and language are filled
@@ -936,6 +1693,16 @@ export default function TransactionForm({ collections }: Props) {
                                     </>
                                 ) : (
                                     <>
+                                        {item.scryfallId && item.cardName && (
+                                            <p className="rounded-xl border border-teal/25 bg-teal/5 p-3 text-sm">
+                                                Selected: {item.cardName}
+                                                {" · "}
+                                                {item.setCode.toUpperCase()}
+                                                {" #"}
+                                                {item.collectorNumber}
+                                            </p>
+                                        )}
+
                                         <PurchaseCardSearch
                                             selectedId={item.scryfallId}
                                             onSelect={(printing) =>
@@ -961,20 +1728,16 @@ export default function TransactionForm({ collections }: Props) {
                                                     }
                                                     className={inputClass}
                                                 >
-                                                    {[
-                                                        "NM",
-                                                        "LP",
-                                                        "MP",
-                                                        "HP",
-                                                        "DMG",
-                                                    ].map((condition) => (
-                                                        <option
-                                                            key={condition}
-                                                            value={condition}
-                                                        >
-                                                            {condition}
-                                                        </option>
-                                                    ))}
+                                                    {CONDITIONS.map(
+                                                        (condition) => (
+                                                            <option
+                                                                key={condition}
+                                                                value={condition}
+                                                            >
+                                                                {condition}
+                                                            </option>
+                                                        )
+                                                    )}
                                                 </select>
                                             </label>
 
@@ -983,8 +1746,9 @@ export default function TransactionForm({ collections }: Props) {
 
                                                 <select
                                                     value={
-                                                        item.availableFinishes
-                                                            .includes(item.finish)
+                                                        item.availableFinishes.includes(
+                                                            item.finish
+                                                        )
                                                             ? item.finish
                                                             : ""
                                                     }
@@ -1031,7 +1795,7 @@ export default function TransactionForm({ collections }: Props) {
                                                     }
                                                     placeholder="en"
                                                     required
-                                                    maxLength={3}
+                                                    maxLength={100}
                                                     className={inputClass}
                                                 />
                                             </label>
@@ -1048,7 +1812,7 @@ export default function TransactionForm({ collections }: Props) {
                                         max={
                                             type === "sale"
                                                 ? selected?.quantity ?? 1
-                                                : 4294967295
+                                                : MAX_QUANTITY
                                         }
                                         step="1"
                                         value={item.quantity}
@@ -1067,25 +1831,83 @@ export default function TransactionForm({ collections }: Props) {
                         );
                     })}
 
-                    <button
-                        type="button"
-                        disabled={
-                            items.length >= 1000 || saleUnavailable
-                        }
-                        onClick={() => {
-                            const fresh = emptyCard(
-                                nextRowKey.current++
-                            );
+                    {totalCardPages > 1 && (
+                        <nav
+                            aria-label="Card pages"
+                            className="flex flex-wrap items-center justify-between gap-3"
+                        >
+                            <button
+                                type="button"
+                                disabled={currentCardPage === 1}
+                                onClick={() => setCardPage(currentCardPage - 1)}
+                                className={buttonClass}
+                            >
+                                Previous
+                            </button>
 
-                            setItems((current) => [
-                                ...current,
-                                fresh,
-                            ]);
-                        }}
-                        className={buttonClass}
-                    >
-                        Add Another Card
-                    </button>
+                            <label className="flex items-center gap-2 text-sm text-muted">
+                                Page
+                                <select
+                                    aria-label="Card page"
+                                    value={currentCardPage}
+                                    onChange={(event) =>
+                                        setCardPage(Number(event.target.value))
+                                    }
+                                    className="rounded-lg border border-border bg-background p-2 text-foreground"
+                                >
+                                    {Array.from(
+                                        { length: totalCardPages },
+                                        (_, index) => (
+                                            <option key={index + 1} value={index + 1}>
+                                                {index + 1}
+                                            </option>
+                                        )
+                                    )}
+                                </select>
+                                of {totalCardPages}
+                            </label>
+
+                            <button
+                                type="button"
+                                disabled={currentCardPage === totalCardPages}
+                                onClick={() => setCardPage(currentCardPage + 1)}
+                                className={buttonClass}
+                            >
+                                Next
+                            </button>
+                        </nav>
+                    )}
+
+                    <div className="flex flex-wrap gap-3">
+                        <button
+                            type="button"
+                            disabled={
+                                items.length >= MAX_ITEMS ||
+                                saleUnavailable
+                            }
+                            onClick={() => {
+                                const fresh = emptyCard(
+                                    nextRowKey.current++
+                                );
+
+                                setItems((current) => [...current, fresh]);
+                                setCardPage(Math.ceil(
+                                    (items.length + 1) / CARDS_PER_PAGE
+                                ));
+                            }}
+                            className={buttonClass}
+                        >
+                            Add Another Card
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={resetSelection}
+                            className={buttonClass}
+                        >
+                            Clear Card Rows
+                        </button>
+                    </div>
                 </section>
 
                 <label className="flex flex-col gap-2">
@@ -1104,10 +1926,14 @@ export default function TransactionForm({ collections }: Props) {
 
                 <button
                     type="submit"
-                    disabled={busy || saleUnavailable}
+                    disabled={locked || saleUnavailable}
                     className="inline-flex items-center justify-center rounded-xl border border-[#efd079] bg-[#efd079] px-6 py-3 text-lg font-bold text-[#03101f] shadow-lg shadow-[#efd079]/15 transition-colors enabled:hover:border-[#ffe7a1] enabled:hover:bg-[#ffe7a1] disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                    {busy ? "Saving…" : "Save Transaction"}
+                    {busy
+                        ? "Saving…"
+                        : importing
+                            ? "Loading…"
+                            : "Save Transaction"}
                 </button>
             </fieldset>
         </form>

@@ -516,7 +516,7 @@ function Welcome() {
         <div className="space-y-14 py-8">
             <section className="max-w-3xl">
                 <p className="font-semibold text-accent">
-                    Prowess
+                    Collector Ouphe
                 </p>
 
                 <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight sm:text-6xl">

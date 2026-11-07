@@ -21,7 +21,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Prowess",
+  title: "Collector Ouphe",
   description: "Track your cards, transactions, and collection value.",
 };
 
@@ -84,11 +84,11 @@ export default function RootLayout({
                 aria-hidden="true"
                 className="brand-mark flex h-10 w-10 items-center justify-center rounded-xl text-lg font-bold"
               >
-                P
+                CO
               </span>
 
               <span className="brand-name text-xl font-bold tracking-tight transition-colors">
-                Prowess
+                Collector Ouphe
               </span>
             </Link>
 
@@ -143,7 +143,7 @@ export default function RootLayout({
         <footer className="site-footer mt-12">
           <div className="mx-auto flex max-w-6xl items-center justify-center px-6 py-6 text-center text-sm text-muted">
             <p>
-              © Prowess
+              © Collector Ouphe
             </p>
           </div>
         </footer>

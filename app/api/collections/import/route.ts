@@ -174,7 +174,7 @@ async function resolveScryfallId(
         {
             headers: {
                 Accept: "application/json",
-                "User-Agent": "Prowess/0.1",
+                "User-Agent": "Collector Ouphe/0.1",
             },
             cache: "no-store",
             signal: AbortSignal.timeout(15000),

@@ -67,7 +67,7 @@ async function fetchBatch(ids) {
                 headers: {
                     Accept: "application/json",
                     "Content-Type": "application/json",
-                    "User-Agent": "Prowess/0.1",
+                    "User-Agent": "Collector Ouphe/0.1",
                 },
                 body: JSON.stringify({
                     identifiers: ids.map((id) => ({ id })),

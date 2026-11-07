@@ -3,7 +3,7 @@ import type { RowDataPacket } from "mysql2";
 import { connection } from "next/server";
 import { db } from "@/lib/server/database";
 
-export const SESSION_COOKIE = "prowess_session";
+export const SESSION_COOKIE = "ouphe_session";
 export const SESSION_SECONDS = 60 * 60 * 24 * 7;
 
 export const sessionCookieOptions = {

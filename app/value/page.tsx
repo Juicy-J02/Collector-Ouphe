@@ -6,6 +6,7 @@ import type { RowDataPacket } from "mysql2";
 
 import AutoRecordSnapshot from "@/components/AutoRecordSnapshot";
 import ValueCardsTable from "@/components/valueCardsTable";
+import ValueViewPicker from "@/components/valueViewPicker";
 import { db } from "@/lib/server/database";
 import {
     loadScryfallPrices,
@@ -72,9 +73,6 @@ const money = (cents: number) => usd.format(cents / 100);
 
 const variantKey = (id: string, finish: string) =>
     `${id}:${finish}`;
-
-const selectClass =
-    "w-full rounded-xl border border-border bg-background p-3 text-foreground";
 
 function selection(value: unknown): string {
     if (
@@ -319,7 +317,11 @@ async function loadCollectionHistory(
 
     return rows.map((row) => ({
         day: row.day,
-        cents: row.cents === null ? null : Number(row.cents),
+        cents:
+            row.cents === null ||
+            (Number(row.covered) === 0 && Number(row.variant_count) > 0)
+                ? null
+                : Number(row.cents),
         covered: Number(row.covered),
         variantCount: Number(row.variant_count),
     }));
@@ -363,7 +365,8 @@ function buildHistory(
             return {
                 day,
                 covered,
-                cents: covered === cards.length ? cents : null,
+                variantCount: cards.length,
+                cents: covered > 0 ? cents : null,
             };
         });
 }
@@ -409,13 +412,13 @@ async function loadHistory(
 }
 
 function changeClass(change: number | null) {
-    if (change === null || change === 0) {
+    if (change === null || !Number.isFinite(change) || change === 0) {
         return "text-muted";
     }
 
     return change > 0
-        ? "text-green-400"
-        : "text-red-400";
+        ? "text-[#4ade80]"
+        : "text-[#f87171]";
 }
 
 function signedMoney(cents: number) {
@@ -568,7 +571,7 @@ function HistoryGraph({
     if (!chart) {
         return (
             <p>
-                No complete daily snapshots to graph yet.
+                No priced daily snapshots to graph yet.
                 {type === "collection"
                     ? " Collection snapshots are recorded automatically when you view this page."
                     : " Available transaction prices are recorded automatically."}
@@ -580,6 +583,9 @@ function HistoryGraph({
     const last = chart.points[chart.points.length - 1];
     const change = last.cents - first.cents;
     const enoughHistory = chart.points.length >= 2;
+    const isPartial = (point: HistoryPoint) =>
+        point.variantCount !== undefined && point.covered < point.variantCount;
+    const partialHistory = chart.points.some(isPartial);
 
     const comparison =
         baseline === null
@@ -606,16 +612,20 @@ function HistoryGraph({
         <div className="space-y-4">
             <div className="grid gap-4 sm:grid-cols-2">
                 <Metric
-                    title="Latest recorded reference value"
+                    title={isPartial(last)
+                        ? "Latest recorded priced portion"
+                        : "Latest recorded reference value"}
                     value={money(last.cents)}
                     change={last.cents}
                 />
 
                 <Metric
                     title={
-                        type === "collection"
-                            ? "Collection value change over shown history"
-                            : "Market value change over shown history"
+                        partialHistory
+                            ? "Priced portion change over shown history"
+                            : type === "collection"
+                                ? "Collection value change over shown history"
+                                : "Market value change over shown history"
                     }
                     value={
                         enoughHistory
@@ -643,9 +653,9 @@ function HistoryGraph({
                     </title>
 
                     <desc>
-                        Dots show complete recorded daily values.
+                        Dots show totals for cards with available prices. Hollow dots indicate partial coverage.
                         A dashed line, when present, shows the transaction total.
-                        Incomplete dates break the line.
+                        Dates with no available prices break the line. Missing card prices are excluded, not estimated.
                     </desc>
 
                     {/* Horizontal grid lines and money labels */}
@@ -700,10 +710,12 @@ function HistoryGraph({
                             cx={chart.x(point.day)}
                             cy={chart.y(point.cents)}
                             r="4"
-                            fill={stroke}
+                            fill={isPartial(point) ? "#071827" : stroke}
+                            stroke={stroke}
+                            strokeWidth="2"
                         >
                             <title>
-                                {`${point.day}: ${money(point.cents)}`}
+                                {`${point.day}: ${money(point.cents)} — ${point.covered}/${point.variantCount ?? point.covered} variants priced${isPartial(point) ? " (partial)" : ""}`}
                             </title>
                         </circle>
                     ))}
@@ -721,7 +733,6 @@ function HistoryGraph({
                         {history[0].day}
                     </text>
 
-                    {/* Last date, shown only when the dates differ */}
                     {chart.start !== chart.end && (
                         <text
                             x={chart.x(history[history.length - 1].day)}
@@ -747,7 +758,7 @@ function HistoryGraph({
             </div>
 
             <p className="text-sm text-muted">
-                Solid line: recorded value.{" "}
+                Solid line: total of available recorded prices. Hollow dots indicate partial coverage.{" "}
                 {baseline !== null && (
                     <>
                         Dashed line:{" "}
@@ -760,38 +771,17 @@ function HistoryGraph({
                 Hover over a point for its date and value.
                 The change compares {first.day} with{" "}
                 {last.day}; it is not realized profit.
+                {" "}Unpriced cards are excluded. Changes in coverage or collection contents
+                can change the total independently of market prices.
             </p>
 
             {!enoughHistory && (
                 <p className="text-sm text-muted">
-                    You have one complete snapshot date.
+                    You have one priced snapshot date.
                     Visit again on a different day to show a trend.
                 </p>
             )}
         </div>
-    );
-}
-
-async function selectValueView(formData: FormData) {
-    "use server";
-
-    const view = formData.get("view");
-
-    if (typeof view !== "string") {
-        notFound();
-    }
-
-    const match =
-        /^(collection|transaction):(all|[1-9]\d{0,19})$/.exec(
-            view
-        );
-
-    if (!match) {
-        notFound();
-    }
-
-    redirect(
-        `/value?${match[1]}=${encodeURIComponent(match[2])}`
     );
 }
 
@@ -925,6 +915,7 @@ async function UserValue({ searchParams }: Props) {
     );
 
     const complete = cards.length > 0 && missing === 0;
+    const hasCurrentPrices = values.some((card) => card.cents !== null);
 
     const paid = options
         .filter((transaction) => transaction.type === "purchase")
@@ -980,7 +971,7 @@ async function UserValue({ searchParams }: Props) {
             )
             : [];
 
-    const firstCompleteValue =
+    const firstPricedValue =
         history.find((point) => point.cents !== null)?.cents ??
         null;
 
@@ -988,64 +979,24 @@ async function UserValue({ searchParams }: Props) {
 
     return (
         <div className="mt-6 space-y-6">
-            <form
-                action={selectValueView}
-                className="flex flex-wrap items-end gap-4 rounded-xl border border-border bg-surface p-5"
+            <section
+                aria-label="Choose value view"
+                className="rounded-xl border border-border bg-surface p-5"
             >
-                <label className="flex min-w-0 flex-1 flex-col gap-2 text-sm font-medium">
-                    View value for
+                <ValueViewPicker
+                    key={selectedValue}
+                    selectedValue={selectedValue}
+                    collections={collections.map(({ id, name }) => ({ id, name }))}
+                    transactions={options.map((option) => ({
+                        id: option.id,
+                        name: option.name,
+                        type: option.type,
+                        date: option.occurred_at_sql.slice(0, 10),
+                        amountCents: Number(option.amount_cents),
+                    }))}
+                />
 
-                    <select
-                        name="view"
-                        defaultValue={selectedValue}
-                        key={selectedValue}
-                        className={selectClass}
-                    >
-                        <optgroup label="Collections">
-                            <option value="collection:all">
-                                All collections
-                            </option>
-
-                            {collections.map((collection) => (
-                                <option
-                                    key={collection.id}
-                                    value={`collection:${collection.id}`}
-                                >
-                                    {collection.name}
-                                </option>
-                            ))}
-                        </optgroup>
-
-                        <optgroup label="Transactions">
-                            <option value="transaction:all">
-                                Account overview
-                            </option>
-
-                            {options.map((transaction) => (
-                                <option
-                                    key={transaction.id}
-                                    value={`transaction:${transaction.id}`}
-                                >
-                                    {transaction.name}
-                                    {" — "}
-                                    {transaction.type}
-                                    {" — "}
-                                    {transaction.occurred_at_sql.slice(0, 10)}
-                                    {" — "}
-                                    {money(Number(transaction.amount_cents))}
-                                </option>
-                            ))}
-                        </optgroup>
-                    </select>
-                </label>
-
-                <button
-                    type="submit"
-                    className="rounded-xl border border-accent/50 bg-surface px-5 py-3 font-semibold text-accent transition-colors hover:border-accent hover:bg-surface-hover"
-                >
-                    View
-                </button>
-            </form>
+            </section>
 
             {transaction ? (
                 <>
@@ -1066,41 +1017,46 @@ async function UserValue({ searchParams }: Props) {
                                     : "Sale proceeds"
                             }
                             value={money(baseline)}
+                            change={baseline}
                         />
 
                         <Metric
                             title={
                                 complete
                                     ? "Current reference value"
-                                    : "Priced portion (incomplete)"
+                                    : "Current priced portion"
                             }
-                            value={money(currentCents)}
+                            value={hasCurrentPrices || quantity === 0 ? money(currentCents) : "No available prices"}
                             change={currentCents}
                         />
 
                         <Metric
                             title={
                                 transaction.type === "purchase"
-                                    ? "Market value minus purchase cost"
-                                    : "Sale proceeds minus current reference value"
+                                    ? complete
+                                        ? "Market value minus purchase cost"
+                                        : "Priced portion minus full purchase cost"
+                                    : complete
+                                        ? "Sale proceeds minus current reference value"
+                                        : "Full sale proceeds minus priced portion"
                             }
                             value={
-                                complete
+                                hasCurrentPrices
                                     ? signedMoney(difference)
-                                    : "Unavailable"
+                                    : "No available prices"
                             }
-                            change={complete ? difference : null}
+                            change={hasCurrentPrices ? difference : null}
                         />
 
                         <Metric
-                            title="Percentage difference"
+                            title={complete ? "Percentage difference" : "Partial-basket difference (%)"}
                             value={
-                                complete
+                                hasCurrentPrices
                                     ? signedPercent(difference, baseline)
                                     : "—"
                             }
                             change={
-                                complete && baseline > 0
+                                hasCurrentPrices && baseline > 0
                                     ? difference
                                     : null
                             }
@@ -1121,6 +1077,13 @@ async function UserValue({ searchParams }: Props) {
                         {transaction.type === "purchase"
                             ? "This compares the original purchased basket with today's market. It is not realized profit or remaining inventory value."
                             : "This compares sale proceeds with today's reference value of the sold basket. It is not sale profit, which requires acquisition costs."}
+                        {!complete && (
+                            <>
+                                {" "}The priced portion excludes {missing} unpriced copies.
+                                Differences compare only this priced portion with the full
+                                transaction amount; they are not a complete gain or loss.
+                            </>
+                        )}
                     </p>
                 </>
             ) : collectionMode ? (
@@ -1136,7 +1099,7 @@ async function UserValue({ searchParams }: Props) {
                                     ? "Priced portion (incomplete)"
                                     : "Current collection value"
                             }
-                            value={money(currentCents)}
+                            value={hasCurrentPrices || quantity === 0 ? money(currentCents) : "No available prices"}
                             change={currentCents}
                         />
 
@@ -1169,23 +1132,26 @@ async function UserValue({ searchParams }: Props) {
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                         <Metric
                             title="Priced current collection value"
-                            value={money(currentCents)}
+                            value={hasCurrentPrices || quantity === 0 ? money(currentCents) : "No available prices"}
                             change={currentCents}
                         />
 
                         <Metric
                             title="Total purchases (USD)"
                             value={money(paid)}
+                            change={paid}
                         />
 
                         <Metric
                             title="Total sale proceeds (USD)"
                             value={money(received)}
+                            change={received}
                         />
 
                         <Metric
                             title="Net cash spent"
                             value={money(paid - received)}
+                            change={paid - received}
                         />
 
                         <Metric
@@ -1243,12 +1209,12 @@ async function UserValue({ searchParams }: Props) {
                 <section className="space-y-3 rounded-xl border border-border bg-surface p-5">
                     <h2 className="text-xl font-semibold">
                         {transaction ? "Transaction" : "Collection"}{" "}
-                        value over time
+                        priced value over time
                     </h2>
 
                     <p className="text-sm text-muted">
                         {transaction
-                            ? "Last 90 days of recorded prices on or after the transaction date (UTC). These are daily observations, not exact purchase-time quotes. Missing prices leave transaction totals incomplete."
+                            ? "Last 90 days of recorded prices on or after the transaction date (UTC). Each point includes all available prices, even when some cards have no price. Unpriced cards are excluded. Partial totals are labeled, and coverage changes can affect the total."
                             : "Shows the total for cards with available prices. Unpriced cards are excluded. Coverage shows how many printing/finish variants were priced. Changes in coverage can affect the total."}
                     </p>
 
@@ -1277,7 +1243,7 @@ async function UserValue({ searchParams }: Props) {
                                         </th>
                                         <th className="p-3">
                                             {transaction
-                                                ? "Comparison"
+                                                ? "Priced value vs transaction total"
                                                 : "Change since first priced snapshot"}
                                         </th>
                                         <th className="p-3">
@@ -1298,11 +1264,11 @@ async function UserValue({ searchParams }: Props) {
                                                         ? baseline - point.cents
                                                         : point.cents - baseline;
                                             } else if (
-                                                firstCompleteValue !== null
+                                                firstPricedValue !== null
                                             ) {
                                                 comparison =
                                                     point.cents -
-                                                    firstCompleteValue;
+                                                    firstPricedValue;
                                             }
                                         }
 
@@ -1315,10 +1281,16 @@ async function UserValue({ searchParams }: Props) {
                                                     {point.day}
                                                 </td>
 
-                                                <td className="p-3">
+                                                <td className={`p-3 ${changeClass(point.cents)}`}>
                                                     {point.cents === null
-                                                        ? "Incomplete"
+                                                        ? "No available prices"
                                                         : money(point.cents)}
+                                                    {point.cents !== null &&
+                                                        point.covered < (point.variantCount ?? cards.length) && (
+                                                            <span className="ml-2 rounded border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-xs text-amber-300">
+                                                                Partial
+                                                            </span>
+                                                        )}
                                                 </td>
 
                                                 <td
@@ -1329,6 +1301,12 @@ async function UserValue({ searchParams }: Props) {
                                                     {comparison === null
                                                         ? "—"
                                                         : signedMoney(comparison)}
+                                                    {transaction && point.cents !== null &&
+                                                        point.covered < (point.variantCount ?? cards.length) && (
+                                                            <span className="mt-1 block text-xs font-normal text-muted">
+                                                                Priced portion vs full transaction amount
+                                                            </span>
+                                                        )}
                                                 </td>
 
                                                 <td className="p-3">

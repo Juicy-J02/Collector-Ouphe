@@ -193,11 +193,11 @@ export default function SignIn() {
               aria-hidden="true"
               className="brand-mark flex h-12 w-12 items-center justify-center rounded-2xl text-2xl font-bold"
             >
-              P
+              CO
             </span>
 
             <span className="text-2xl font-bold tracking-tight text-accent">
-              Prowess
+              Collector Ouphe
             </span>
           </Link>
         </div>
@@ -253,7 +253,7 @@ export default function SignIn() {
                     {user
                       ? "Account"
                       : registering
-                        ? "Join Prowess"
+                        ? "Join Collector Ouphe"
                         : "Welcome back"}
                   </span>
 
@@ -487,7 +487,7 @@ export default function SignIn() {
                       <p className="text-sm text-muted">
                         {registering
                           ? "Already have an account?"
-                          : "New to Prowess?"}
+                          : "New to Collector Ouphe?"}
                       </p>
 
                       <button

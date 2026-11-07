@@ -9,7 +9,7 @@ export async function getCard(cardName: string): Promise<Card | null> {
         {
             headers: {
                 Accept: "application/json",
-                "User-Agent": "Prowess/0.1",
+                "User-Agent": "Collector Ouphe/0.1",
             },
         }
     );
@@ -35,7 +35,7 @@ export async function getCardPrices(cardName: string): Promise<Prices | null> {
         {
             headers: {
                 Accept: "application/json",
-                "User-Agent": "Prowess/0.1",
+                "User-Agent": "Collector Ouphe/0.1",
             },
         }
     );

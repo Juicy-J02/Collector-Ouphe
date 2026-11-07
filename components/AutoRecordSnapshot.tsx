@@ -20,6 +20,7 @@ export default function AutoRecordSnapshot({
     );
     const [error, setError] = useState("");
     const [attempt, setAttempt] = useState(0);
+    const [checking, setChecking] = useState(true);
 
     // Share the request during Strict Mode's effect replay.
     const pending = useRef<{
@@ -32,6 +33,7 @@ export default function AutoRecordSnapshot({
         const key = `${transactionId}:${attempt}`;
 
         setError("");
+        setChecking(true);
         setStatus("Checking today's price history…");
 
         async function record(): Promise<Result> {
@@ -60,7 +62,8 @@ export default function AutoRecordSnapshot({
 
             if (!response.ok) {
                 throw new Error(
-                    data.error ?? "Could not record today's prices."
+                    data.error ??
+                    "Could not record today's prices."
                 );
             }
 
@@ -80,8 +83,10 @@ export default function AutoRecordSnapshot({
 
                 setStatus(
                     data.missing > 0
-                        ? `Available prices recorded. ${data.missing} ` +
-                          "printing/finish variants still have no daily price."
+                        ? `Today's price check is complete. ` +
+                          `${data.missing} printing/finish ` +
+                          `${data.missing === 1 ? "variant has" : "variants have"} ` +
+                          "no available USD price. Available prices are recorded."
                         : "Today's available prices are recorded."
                 );
 
@@ -99,6 +104,11 @@ export default function AutoRecordSnapshot({
                         ? error.message
                         : "Could not record today's prices."
                 );
+            })
+            .finally(() => {
+                if (active) {
+                    setChecking(false);
+                }
             });
 
         return () => {
@@ -107,9 +117,12 @@ export default function AutoRecordSnapshot({
     }, [transactionId, attempt, router]);
 
     return (
-        <div className="space-y-2 text-sm">
+        <div
+            aria-busy={checking}
+            className="space-y-3 text-sm"
+        >
             {status && (
-                <p role="status" className="text-zinc-500">
+                <p role="status" className="text-muted">
                     {status}
                 </p>
             )}
@@ -117,20 +130,23 @@ export default function AutoRecordSnapshot({
             {error && (
                 <>
                     <p
-                        role="status"
-                        className="text-amber-600"
+                        role="alert"
+                        className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-amber-300"
                     >
                         {error} Existing history is still shown.
                     </p>
 
                     <button
                         type="button"
+                        disabled={checking}
                         onClick={() =>
                             setAttempt((value) => value + 1)
                         }
-                        className="underline"
+                        className="rounded-lg border border-border px-3 py-2 text-foreground transition-colors enabled:hover:border-teal disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                        Retry price recording
+                        {checking
+                            ? "Checking prices…"
+                            : "Retry price recording"}
                     </button>
                 </>
             )}

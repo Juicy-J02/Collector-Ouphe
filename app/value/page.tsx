@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import Link from "next/link";
 import { cookies } from "next/headers";
 import { connection } from "next/server";
 import { notFound, redirect } from "next/navigation";
@@ -975,6 +976,46 @@ async function UserValue({ searchParams }: Props) {
         history.find((point) => point.cents !== null)?.cents ??
         null;
 
+    const historyPageSize = 10;
+    const rawHistoryPage = params.historyPage;
+    const requestedHistoryPage =
+        typeof rawHistoryPage === "string" && /^[1-9]\d*$/.test(rawHistoryPage)
+            ? Number(rawHistoryPage)
+            : 1;
+    const historyPageCount = Math.max(1, Math.ceil(history.length / historyPageSize));
+    const historyPage = Number.isSafeInteger(requestedHistoryPage)
+        ? Math.min(requestedHistoryPage, historyPageCount)
+        : 1;
+    const historyOffset = (historyPage - 1) * historyPageSize;
+    const historyByDay = new Map(history.map((point) => [point.day, point]));
+    // Calculate from the complete history so comparisons work across page boundaries.
+    const historyRows = history.map((point) => {
+        const previousDate = new Date(`${point.day}T00:00:00Z`);
+        previousDate.setUTCDate(previousDate.getUTCDate() - 1);
+        const previous = historyByDay.get(previousDate.toISOString().slice(0, 10));
+        return {
+            ...point,
+            dailyChange:
+                point.cents !== null && previous && previous.cents !== null
+                    ? point.cents - previous.cents
+                    : null,
+        };
+    }).slice(historyOffset, historyOffset + historyPageSize);
+
+    function historyPageHref(page: number) {
+        const query = new URLSearchParams();
+        for (const [key, value] of Object.entries(params)) {
+            if (key === "historyPage" || value === undefined) continue;
+            if (Array.isArray(value)) {
+                value.forEach((entry) => query.append(key, entry));
+            } else {
+                query.set(key, value);
+            }
+        }
+        query.set("historyPage", String(page));
+        return `?${query.toString()}#value-history`;
+    }
+
     const checkedAt = new Date().toISOString();
 
     return (
@@ -1206,7 +1247,7 @@ async function UserValue({ searchParams }: Props) {
             )}
 
             {(transaction || collectionMode) && (
-                <section className="space-y-3 rounded-xl border border-border bg-surface p-5">
+                <section id="value-history" className="space-y-3 rounded-xl border border-border bg-surface p-5">
                     <h2 className="text-xl font-semibold">
                         {transaction ? "Transaction" : "Collection"}{" "}
                         priced value over time
@@ -1231,6 +1272,7 @@ async function UserValue({ searchParams }: Props) {
                                 : "No saved snapshots yet. Collection snapshots are recorded automatically when you view this page."}
                         </p>
                     ) : (
+                        <div className="space-y-3">
                         <div className="overflow-x-auto rounded-xl border border-border">
                             <table className="w-full text-left text-sm">
                                 <thead>
@@ -1247,13 +1289,16 @@ async function UserValue({ searchParams }: Props) {
                                                 : "Change since first priced snapshot"}
                                         </th>
                                         <th className="p-3">
+                                            Change from previous day
+                                        </th>
+                                        <th className="p-3">
                                             Coverage
                                         </th>
                                     </tr>
                                 </thead>
 
                                 <tbody>
-                                    {history.map((point) => {
+                                    {historyRows.map((point) => {
                                         let comparison: number | null =
                                             null;
 
@@ -1309,6 +1354,17 @@ async function UserValue({ searchParams }: Props) {
                                                         )}
                                                 </td>
 
+                                                <td
+                                                    className={`p-3 font-medium ${changeClass(point.dailyChange)}`}
+                                                    title={point.dailyChange === null
+                                                        ? "No priced snapshot available for this date or the previous calendar day."
+                                                        : undefined}
+                                                >
+                                                    {point.dailyChange === null
+                                                        ? "—"
+                                                        : signedMoney(point.dailyChange)}
+                                                </td>
+
                                                 <td className="p-3">
                                                     {point.covered}/
                                                     {point.variantCount ??
@@ -1321,6 +1377,29 @@ async function UserValue({ searchParams }: Props) {
                                     })}
                                 </tbody>
                             </table>
+                        </div>
+                        <nav aria-label="Value history pagination" className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                            <p className="text-muted">
+                                Showing {historyOffset + 1}–{Math.min(historyOffset + historyPageSize, history.length)} of {history.length} entries
+                                {" · "}Page {historyPage} of {historyPageCount}
+                            </p>
+                            <div className="flex gap-3">
+                                {historyPage > 1 ? (
+                                    <Link href={historyPageHref(historyPage - 1)} scroll={false} className="rounded border border-border px-3 py-2 hover:bg-background">
+                                        Previous
+                                    </Link>
+                                ) : (
+                                    <span aria-disabled="true" className="rounded border border-border px-3 py-2 text-muted opacity-50">Previous</span>
+                                )}
+                                {historyPage < historyPageCount ? (
+                                    <Link href={historyPageHref(historyPage + 1)} scroll={false} className="rounded border border-border px-3 py-2 hover:bg-background">
+                                        Next
+                                    </Link>
+                                ) : (
+                                    <span aria-disabled="true" className="rounded border border-border px-3 py-2 text-muted opacity-50">Next</span>
+                                )}
+                            </div>
+                        </nav>
                         </div>
                     )}
                 </section>
